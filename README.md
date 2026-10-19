@@ -22,11 +22,11 @@ Obsidian's built-in move dialog always lists folders in the same fixed order, so
 Each move into a folder adds one point that decays over time:
 
 ```
-weight(age) = 0.995 × 0.5^(age / 45 days) + 0.005 × 0.5^(age / 180 days)
+weight(age) = 0.995 × 0.5^(age / 14 days) + 0.005 × 0.5^(age / 60 days)
 score       = Σ weight over all moves into the folder
 ```
 
-More moves add more terms and recent moves weigh more, so both frequency and recency count. The small 180-day term lets a folder you used a few times recently fall back behind a long-time favourite once you stop using it. Ties go to the most recently used folder. History from 1.0 is kept in its original order.
+More moves add more terms and recent moves weigh more, so both frequency and recency count. The small 60-day term lets a folder you used a few times recently fall back behind a long-time favourite once you stop using it. Ties go to the most recently used folder. History from 1.0 is kept in its original order.
 
 ## Usage
 

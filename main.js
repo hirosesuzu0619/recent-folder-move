@@ -51,7 +51,7 @@ const STRINGS = {
     cleared: "使用记录已清空",
     sStats: "使用统计",
     sStatsEmpty: "还没有转移记录。",
-    sStatsDesc: "每次转移记 1 分，之后随时间衰减（99.5% 按 45 天半衰期、0.5% 按 180 天半衰期）。得分 = 所有转移的衰减值之和，所以转得越多、越近，排得越前。",
+    sStatsDesc: "每次转移记 1 分，之后随时间衰减（99.5% 按 14 天半衰期、0.5% 按 60 天半衰期）。得分 = 所有转移的衰减值之和，所以转得越多、越近，排得越前。",
     statLine: (n, score, last) => `转移 ${n} 次 · 得分 ${score} · 上次 ${last}`,
     badgeTitle: (n) => `转移 ${n} 次`,
     pinned: (p) => `已置顶 ${p}`,
@@ -89,7 +89,7 @@ const STRINGS = {
     cleared: "History cleared",
     sStats: "Usage",
     sStatsEmpty: "No moves recorded yet.",
-    sStatsDesc: "Each move adds 1 point that decays over time (99.5% with a 45-day half-life, 0.5% with a 180-day half-life). A folder's score is the sum, so more moves and more recent moves both rank higher.",
+    sStatsDesc: "Each move adds 1 point that decays over time (99.5% with a 14-day half-life, 0.5% with a 60-day half-life). A folder's score is the sum, so more moves and more recent moves both rank higher.",
     statLine: (n, score, last) => `${n} move(s) · score ${score} · last ${last}`,
     badgeTitle: (n) => `${n} move(s)`,
     pinned: (p) => `Pinned ${p}`,
@@ -129,7 +129,7 @@ function defaultSettings() {
 /* ------------------------------------------------------------------ */
 
 // A folder's score is the sum over all moves into it of
-//   0.995 * 0.5^(age / 45 days) + 0.005 * 0.5^(age / 180 days)
+//   0.995 * 0.5^(age / 14 days) + 0.005 * 0.5^(age / 60 days)
 // so more moves and more recent moves both rank higher. The slow 0.5% term
 // lets a folder that was used a few times recently fall back behind a
 // long-time favourite once you stop using it; with a single exponential the
@@ -139,8 +139,8 @@ function defaultSettings() {
 // "as of" a timestamp and aged forward on demand: storage per folder is O(1)
 // no matter how many moves were made.
 const DAY_MS = 86400000;
-const RECENT_HALF_LIFE_DAYS = 45;
-const LONG_HALF_LIFE_DAYS = 180;
+const RECENT_HALF_LIFE_DAYS = 14;
+const LONG_HALF_LIFE_DAYS = 60;
 const LONG_WEIGHT = 0.005;
 // Drag-and-drop of several files fires one rename per file; renames into the
 // same folder this close together count as a single move.
