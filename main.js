@@ -52,6 +52,7 @@ const STRINGS = {
     sStats: "使用统计",
     sStatsEmpty: "还没有转移记录。",
     sStatsDesc: "每次转移记 1 分，之后随时间衰减（99.5% 按 14 天半衰期、0.5% 按 60 天半衰期）。得分 = 所有转移的衰减值之和，所以转得越多、越近，排得越前。",
+    sStatsDevices: (n) => `每台设备只写自己那一份记录，随库同步后合并显示（当前 ${n} 台设备）。清空会对所有设备生效。`,
     statLine: (n, score, last) => `转移 ${n} 次 · 得分 ${score} · 上次 ${last}`,
     badgeTitle: (n) => `转移 ${n} 次`,
     pinned: (p) => `已置顶 ${p}`,
@@ -90,6 +91,7 @@ const STRINGS = {
     sStats: "Usage",
     sStatsEmpty: "No moves recorded yet.",
     sStatsDesc: "Each move adds 1 point that decays over time (99.5% with a 14-day half-life, 0.5% with a 60-day half-life). A folder's score is the sum, so more moves and more recent moves both rank higher.",
+    sStatsDevices: (n) => `Each device writes only its own record; they are added up after the vault syncs (${n} device(s) so far). Clearing applies to every device.`,
     statLine: (n, score, last) => `${n} move(s) · score ${score} · last ${last}`,
     badgeTitle: (n) => `${n} move(s)`,
     pinned: (p) => `Pinned ${p}`,
@@ -119,8 +121,10 @@ function defaultSettings() {
     boostWhileSearching: true,
     pinned: [],
     excluded: [],
-    // folder path ("/" = vault root) -> usage entry, see `recordUse`
-    usage: {},
+    // device id -> { usage: { folder path ("/" = vault root) -> entry, see `recordUse` }, since }
+    devices: {},
+    // when history was last cleared on any device; older device sections are dropped
+    resetAt: 0,
   };
 }
 
@@ -201,6 +205,51 @@ function rankUsage(usage, now) {
   return Object.keys(usage)
     .map((path) => ({ path, score: scoreOf(usage[path], now), last: usage[path].last }))
     .sort((a, b) => b.score - a.score || b.last - a.last || (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
+}
+
+/* Per-device storage ------------------------------------------------ */
+// data.json is shared by every device the vault syncs to. If all devices wrote
+// one usage map, two devices moving notes between syncs would overwrite each
+// other. So each device writes only `devices[<its id>]`, and the ranking uses
+// all sections added up (`mergeEntries` sums exactly).
+
+function newDeviceId() {
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") return crypto.randomUUID();
+  return Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 10);
+}
+
+function isValidSection(section) {
+  return (
+    section && typeof section === "object" &&
+    section.usage && typeof section.usage === "object" && !Array.isArray(section.usage) &&
+    typeof section.since === "number" && isFinite(section.since)
+  );
+}
+
+/** Valid device sections only, each with its broken entries removed. */
+function sanitizeDevices(devices) {
+  const result = {};
+  if (!devices || typeof devices !== "object" || Array.isArray(devices)) return result;
+  for (const [id, section] of Object.entries(devices)) {
+    if (!isValidSection(section)) continue;
+    const usage = {};
+    for (const [path, entry] of Object.entries(section.usage)) {
+      if (isValidEntry(entry)) usage[path] = entry;
+    }
+    result[id] = { usage, since: section.since };
+  }
+  return result;
+}
+
+/** All devices' usage summed into one map. */
+function mergeDevices(devices) {
+  const merged = {};
+  for (const section of Object.values(devices)) {
+    for (const [path, entry] of Object.entries(section.usage)) {
+      merged[path] = merged[path] ? mergeEntries(merged[path], entry) : entry;
+    }
+  }
+  return merged;
 }
 
 /**
@@ -308,7 +357,7 @@ class RecentFolderModal extends FuzzySuggestModal {
    */
   computeRanking(items) {
     const settings = this.plugin.settings;
-    const ranked = rankUsage(settings.usage, Date.now()).filter((r) => r.score > 0);
+    const ranked = rankUsage(this.plugin.mergedUsage, Date.now()).filter((r) => r.score > 0);
     this.usageRank = new Map(ranked.map((r, i) => [r.path, i]));
     const listable = new Set(items.map((item) => this.getItemText(item)));
     const limit = Math.max(0, settings.recentLimit);
@@ -372,7 +421,8 @@ class RecentFolderModal extends FuzzySuggestModal {
     renderResults(textEl, path, result.match);
 
     const s = t();
-    const { pinned, usage } = this.plugin.settings;
+    const { pinned } = this.plugin.settings;
+    const usage = this.plugin.mergedUsage;
     if (pinned.includes(path)) {
       el.createSpan({ cls: "rfm-badge rfm-badge-pinned", text: s.badgePinned });
     } else if (this.topPaths && this.topPaths.has(path)) {
@@ -446,7 +496,7 @@ class RecentFolderMovePlugin extends Plugin {
       checkCallback: (checking) => {
         const file = this.app.workspace.getActiveFile();
         if (!file) return false;
-        if (!checking) new RecentFolderModal(this.app, this, [file]).open();
+        if (!checking) this.openModal([file]);
         return true;
       },
     });
@@ -459,7 +509,7 @@ class RecentFolderMovePlugin extends Plugin {
             .setTitle(s.menuMove)
             .setIcon("folder-input")
             .setSection("action")
-            .onClick(() => new RecentFolderModal(this.app, this, [file]).open())
+            .onClick(() => this.openModal([file]))
         );
       })
     );
@@ -472,7 +522,7 @@ class RecentFolderMovePlugin extends Plugin {
             .setTitle(s.menuMove)
             .setIcon("folder-input")
             .setSection("action")
-            .onClick(() => new RecentFolderModal(this.app, this, files).open())
+            .onClick(() => this.openModal(files))
         );
       })
     );
@@ -483,48 +533,135 @@ class RecentFolderMovePlugin extends Plugin {
     this.addSettingTab(new RecentFolderMoveSettingTab(this.app, this));
   }
 
+  /**
+   * A random id kept in this device's local storage, which no sync touches.
+   * Each device records its moves only under its own id in data.json.
+   */
+  loadDeviceId() {
+    const key = "recent-folder-move-device-id";
+    const app = this.app;
+    let id = null;
+    try {
+      id = typeof app.loadLocalStorage === "function" ? app.loadLocalStorage(key) : window.localStorage.getItem(key);
+    } catch (e) {
+      /* ignore */
+    }
+    if (!id) {
+      id = newDeviceId();
+      try {
+        if (typeof app.saveLocalStorage === "function") app.saveLocalStorage(key, id);
+        else window.localStorage.setItem(key, id);
+      } catch (e) {
+        /* ignore */
+      }
+    }
+    return id;
+  }
+
+  /**
+   * Take the other devices' sections and the clear marker from what is on disk
+   * now, keep only our own section from memory. Sections older than the last
+   * "clear history" (on any device) are dropped; ours restarts empty.
+   */
+  adoptDisk(settings, disk) {
+    const resetAt = Math.max(settings.resetAt || 0, (disk && disk.resetAt) || 0);
+    const devices = sanitizeDevices(disk && disk.devices);
+    let own = settings.devices && settings.devices[this.deviceId];
+    if (!isValidSection(own) || own.since < resetAt) own = { usage: {}, since: Math.max(Date.now(), resetAt) };
+    for (const id of Object.keys(devices)) {
+      if (devices[id].since < resetAt) delete devices[id];
+    }
+    devices[this.deviceId] = own;
+    settings.devices = devices;
+    settings.resetAt = resetAt;
+  }
+
   async loadSettings() {
+    if (!this.deviceId) this.deviceId = this.loadDeviceId();
     const data = (await this.loadData()) || {};
     const settings = Object.assign(defaultSettings(), data);
     for (const key of ["pinned", "excluded"]) {
       if (!Array.isArray(settings[key])) settings[key] = [];
     }
 
-    let migrated = false;
-    const stored = data.usage;
-    if (!stored || typeof stored !== "object" || Array.isArray(stored)) {
-      settings.usage = Array.isArray(data.recent) ? usageFromRecentList(data.recent, Date.now()) : {};
-      migrated = true;
-    }
-    if ("recent" in settings) {
-      delete settings.recent;
-      migrated = true;
-    }
-    for (const path of Object.keys(settings.usage)) {
-      if (!isValidEntry(settings.usage[path])) delete settings.usage[path];
+    // 1.0 kept a `recent` list, 1.1 a single `usage` map: both become this device's history.
+    let legacy = null;
+    if (data.usage && typeof data.usage === "object" && !Array.isArray(data.usage)) legacy = data.usage;
+    else if (Array.isArray(data.recent)) legacy = usageFromRecentList(data.recent, Date.now());
+    const migrated = "usage" in data || "recent" in data;
+    delete settings.usage;
+    delete settings.recent;
+
+    settings.devices = sanitizeDevices(data.devices);
+    // After the first load our own section in memory is the authority (only we write it),
+    // so a reload racing with a move cannot lose that move.
+    const current = this.settings && this.settings.devices && this.settings.devices[this.deviceId];
+    if (isValidSection(current)) settings.devices[this.deviceId] = current;
+    this.adoptDisk(settings, data);
+    if (legacy) {
+      const own = settings.devices[this.deviceId].usage;
+      for (const [path, entry] of Object.entries(legacy)) {
+        if (isValidEntry(entry)) own[path] = own[path] ? mergeEntries(own[path], entry) : entry;
+      }
     }
 
     this.settings = settings;
+    this.mergedUsage = mergeDevices(settings.devices);
     if (migrated) await this.saveSettings();
   }
 
   async saveSettings() {
+    // Another device may have synced its moves in since we last read the file.
+    this.adoptDisk(this.settings, await this.loadData());
+    this.mergedUsage = mergeDevices(this.settings.devices);
     await this.saveData(this.settings);
   }
 
-  /** Forget the lowest-scoring folders beyond `historySize`. */
+  /** Called by Obsidian when data.json was changed from outside, e.g. by sync. */
+  async onExternalSettingsChange() {
+    await this.loadSettings();
+  }
+
+  /** Re-read data.json (cheap) so a just-synced move from another device counts, then open the picker. */
+  async openModal(files) {
+    try {
+      await this.loadSettings();
+    } catch (e) {
+      console.error(e);
+    }
+    new RecentFolderModal(this.app, this, files).open();
+  }
+
+  /** This device's own usage map: the only one this device ever writes. */
+  ownUsage() {
+    return this.settings.devices[this.deviceId].usage;
+  }
+
+  /** Forget this device's lowest-scoring folders beyond `historySize`. */
   pruneUsage() {
     const keep = Math.max(1, this.settings.historySize);
-    const ranked = rankUsage(this.settings.usage, Date.now());
-    for (const r of ranked.slice(keep)) delete this.settings.usage[r.path];
+    const usage = this.ownUsage();
+    const ranked = rankUsage(usage, Date.now());
+    for (const r of ranked.slice(keep)) delete usage[r.path];
   }
 
   /** Count one move into a folder. */
   async touch(folderPath) {
     const p = folderPath === "" ? "/" : folderPath;
-    const usage = this.settings.usage;
+    // Pick up a "clear history" from another device first; dropping our section
+    // after recording would drop this move with it.
+    this.adoptDisk(this.settings, await this.loadData());
+    const usage = this.ownUsage();
     usage[p] = recordUse(usage[p], Date.now());
     this.pruneUsage();
+    await this.saveSettings();
+  }
+
+  /** Clear history on every device: each one drops its section the next time it reads data.json. */
+  async clearUsage() {
+    const now = Date.now();
+    this.settings.resetAt = now;
+    this.settings.devices = { [this.deviceId]: { usage: {}, since: now } };
     await this.saveSettings();
   }
 
@@ -598,13 +735,15 @@ class RecentFolderMovePlugin extends Plugin {
           }
           return p;
         });
+      // Only our own section: the other devices remap theirs when the rename syncs to them.
+      const own = settings.devices[this.deviceId];
       const usage = {};
-      for (const [p, entry] of Object.entries(settings.usage)) {
+      for (const [p, entry] of Object.entries(own.usage)) {
         const [q] = remap([p]);
         // Merge in case the new path already had history of its own.
         usage[q] = usage[q] ? mergeEntries(usage[q], entry) : entry;
       }
-      settings.usage = usage;
+      own.usage = usage;
       settings.pinned = remap(settings.pinned);
       settings.excluded = remap(settings.excluded);
     }
@@ -638,9 +777,10 @@ class RecentFolderMovePlugin extends Plugin {
     if (!(file instanceof TFolder)) return;
     const p = file.path;
     let changed = false;
-    for (const x of Object.keys(this.settings.usage)) {
+    const usage = this.ownUsage();
+    for (const x of Object.keys(usage)) {
       if (x !== "/" && isSameOrInside(x, p)) {
-        delete this.settings.usage[x];
+        delete usage[x];
         changed = true;
       }
     }
@@ -673,7 +813,7 @@ class RecentFolderMoveSettingTab extends PluginSettingTab {
           .setValue(settings.recentLimit)
           .setDynamicTooltip()
           .onChange(async (v) => {
-            settings.recentLimit = v;
+            this.plugin.settings.recentLimit = v;
             await this.plugin.saveSettings();
           })
       );
@@ -687,7 +827,7 @@ class RecentFolderMoveSettingTab extends PluginSettingTab {
           .setValue(settings.historySize)
           .setDynamicTooltip()
           .onChange(async (v) => {
-            settings.historySize = v;
+            this.plugin.settings.historySize = v;
             this.plugin.pruneUsage();
             await this.plugin.saveSettings();
           })
@@ -698,7 +838,7 @@ class RecentFolderMoveSettingTab extends PluginSettingTab {
       .setDesc(s.sTrackDesc)
       .addToggle((tg) =>
         tg.setValue(settings.trackExternalMoves).onChange(async (v) => {
-          settings.trackExternalMoves = v;
+          this.plugin.settings.trackExternalMoves = v;
           await this.plugin.saveSettings();
         })
       );
@@ -708,7 +848,7 @@ class RecentFolderMoveSettingTab extends PluginSettingTab {
       .setDesc(s.sBoostDesc)
       .addToggle((tg) =>
         tg.setValue(settings.boostWhileSearching).onChange(async (v) => {
-          settings.boostWhileSearching = v;
+          this.plugin.settings.boostWhileSearching = v;
           await this.plugin.saveSettings();
         })
       );
@@ -720,7 +860,7 @@ class RecentFolderMoveSettingTab extends PluginSettingTab {
         ta.inputEl.rows = 4;
         ta.inputEl.addClass("rfm-textarea");
         ta.setValue(settings.pinned.join("\n")).onChange(async (v) => {
-          settings.pinned = linesToList(v);
+          this.plugin.settings.pinned = linesToList(v);
           await this.plugin.saveSettings();
         });
       });
@@ -732,7 +872,7 @@ class RecentFolderMoveSettingTab extends PluginSettingTab {
         ta.inputEl.rows = 4;
         ta.inputEl.addClass("rfm-textarea");
         ta.setValue(settings.excluded.join("\n")).onChange(async (v) => {
-          settings.excluded = linesToList(v);
+          this.plugin.settings.excluded = linesToList(v);
           await this.plugin.saveSettings();
         });
       });
@@ -742,21 +882,25 @@ class RecentFolderMoveSettingTab extends PluginSettingTab {
         .setButtonText(s.sClearBtn)
         .setWarning()
         .onClick(async () => {
-          settings.usage = {};
-          await this.plugin.saveSettings();
+          await this.plugin.clearUsage();
           new Notice(s.cleared);
           this.display();
         })
     );
 
     new Setting(containerEl).setName(s.sStats).setDesc(s.sStatsDesc).setHeading();
+    containerEl.createEl("p", {
+      cls: "setting-item-description",
+      text: s.sStatsDevices(Object.keys(settings.devices).length),
+    });
     const now = Date.now();
-    const ranked = rankUsage(settings.usage, now);
+    const usage = this.plugin.mergedUsage;
+    const ranked = rankUsage(usage, now);
     if (!ranked.length) {
       containerEl.createEl("p", { cls: "setting-item-description", text: s.sStatsEmpty });
     }
     for (const r of ranked) {
-      const entry = settings.usage[r.path];
+      const entry = usage[r.path];
       new Setting(containerEl)
         .setName(displayPath(r.path))
         .setDesc(s.statLine(entry.n, r.score.toFixed(2), moment(entry.last).format("YYYY-MM-DD")));
@@ -777,4 +921,6 @@ module.exports._internals = {
   mergeEntries,
   rankUsage,
   usageFromRecentList,
+  sanitizeDevices,
+  mergeDevices,
 };

@@ -13,6 +13,7 @@ Obsidian's built-in move dialog always lists folders in the same fixed order, so
 - **Create on the fly** – `Shift+Enter` creates the typed path (nested folders included) and moves the note there.
 - **Tracks every move** – the plugin's own "Move to…" menu, drag and drop in the file explorer and the built-in move command all count (the last two can be turned off). Moving several files at once counts as one move.
 - **Usage stats** – settings list every folder's move count, score and last use.
+- **Syncs across devices** – history lives in the plugin's `data.json` inside the vault, so it travels with the vault. Each device writes only its own section and the sections are added up, so moves made on two devices between syncs never overwrite each other. Clearing history clears it everywhere.
 - **Multi-select** – right-click several files in the file explorer and move them together.
 - Folder renames and deletions keep the history in sync. Links are updated through Obsidian's own file manager.
 - Chinese and English UI, following Obsidian's language setting.
@@ -27,6 +28,21 @@ score       = Σ weight over all moves into the folder
 ```
 
 More moves add more terms and recent moves weigh more, so both frequency and recency count. The small 60-day term lets a folder you used a few times recently fall back behind a long-time favourite once you stop using it. Ties go to the most recently used folder. History from 1.0 is kept in its original order.
+
+## Sync
+
+Move history is stored in `<vault>/.obsidian/plugins/recent-folder-move/data.json`:
+
+```json
+{
+  "devices": {
+    "<device id>": { "usage": { "Projects/A": { "n": 12, "fast": 3.1, "slow": 9.4, "at": 1760000000000, "last": 1760000000000 } }, "since": 1760000000000 }
+  },
+  "resetAt": 0
+}
+```
+
+The device id is kept in each device's local storage. Before saving, a device re-reads the file and replaces only its own section, and the picker re-reads the file each time it opens. Any sync that copies `data.json` works (iCloud, Google Drive, Syncthing, Git). With Obsidian Sync, turn on *Settings → Sync → Installed community plugins*, otherwise plugin data is not synced.
 
 ## Usage
 
