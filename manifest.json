@@ -1,0 +1,9 @@
+{
+  "id": "recent-folder-move",
+  "name": "Recent Folder Move",
+  "version": "1.0.0",
+  "minAppVersion": "1.4.10",
+  "description": "Move notes with a folder picker that lists your most recently used folders first, with pinning, exclusions and create-on-the-fly.",
+  "author": "Suzu",
+  "isDesktopOnly": false
+}
