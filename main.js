@@ -35,8 +35,8 @@ const STRINGS = {
     nothingToCreate: "请先输入要新建的文件夹路径",
     failed: (msg) => `移动失败：${msg}`,
     skipped: (n) => `有 ${n} 项因目标冲突或无法移入自身而跳过`,
-    sRecentLimit: "置顶显示的常用文件夹数",
-    sRecentLimitDesc: "搜索框为空时，按「转移次数 + 时间加权」得分最高的这几个文件夹排在最前。",
+    sRecentLimit: "标记「常用」的文件夹数",
+    sRecentLimitDesc: "搜索框为空时，所有转移过的文件夹都按「转移次数 + 时间加权」得分从高到低排在前面，没转移过的排在后面；得分最高的这几个另外标上「常用」。",
     sHistory: "最多记住多少个文件夹",
     sHistoryDesc: "超出后得分最低的会被遗忘。",
     sTrack: "记录在文件列表里拖拽或用原生命令的移动",
@@ -75,8 +75,8 @@ const STRINGS = {
     nothingToCreate: "Type the path of the folder to create first",
     failed: (msg) => `Move failed: ${msg}`,
     skipped: (n) => `Skipped ${n} item(s) because of a name clash or moving a folder into itself`,
-    sRecentLimit: "Frequent folders shown on top",
-    sRecentLimitDesc: "With an empty query, this many folders with the highest frequency-and-recency score are listed first.",
+    sRecentLimit: "Folders marked \"frequent\"",
+    sRecentLimitDesc: "With an empty query, every folder you have moved notes into is listed first, by frequency-and-recency score, followed by the rest. The top ones also get a \"frequent\" badge.",
     sHistory: "History size",
     sHistoryDesc: "Lowest-scoring folders beyond this are forgotten.",
     sTrack: "Track moves made elsewhere",
@@ -367,7 +367,7 @@ class RecentFolderModal extends FuzzySuggestModal {
   /**
    * Score order of every folder with history, plus the top `recentLimit` of
    * them that are actually listable here (not pinned, not excluded, not the
-   * file's own folder). Those get the "recent" tier and badge.
+   * file's own folder). Those get the "frequent" badge.
    */
   computeRanking(items) {
     const settings = this.plugin.settings;
@@ -382,12 +382,12 @@ class RecentFolderModal extends FuzzySuggestModal {
     }
   }
 
-  /** Rank: pinned > top scored > everything else. `idx` orders within a tier. */
+  /** Rank: pinned > every folder with history, by score > the rest. `idx` orders within a tier. */
   rankOf(path) {
     const pi = this.plugin.settings.pinned.indexOf(path);
     if (pi !== -1) return { tier: 0, idx: pi };
-    const ti = this.topPaths.get(path);
-    if (ti !== undefined) return { tier: 1, idx: ti };
+    const ri = this.usageRank.get(path);
+    if (ri !== undefined) return { tier: 1, idx: ri };
     return { tier: 2, idx: 0 };
   }
 

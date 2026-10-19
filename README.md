@@ -6,7 +6,7 @@ Obsidian's built-in move dialog always lists folders in the same fixed order, so
 
 ## Features
 
-- **Frequent first** – with an empty query, the highest-scoring folders appear at the top, marked "frequent" (hover the badge for the move count).
+- **Frequent first** – with an empty query, every folder you have moved notes into is listed by score, ahead of the rest; the top ones are marked "frequent" (hover the badge for the move count).
 - **Usage-aware search** – when you type, results are ranked by fuzzy match, with higher-scoring folders winning near-ties.
 - **Pinned folders** – always listed first. Pin from settings or press `Shift+Alt+Enter` on a folder in the dialog.
 - **Excluded folders** – hide folders such as `attachments` (and their subfolders) from the list.
