@@ -12,6 +12,7 @@ const {
   prepareFuzzySearch,
   renderResults,
   moment,
+  Platform,
 } = require("obsidian");
 
 /* ------------------------------------------------------------------ */
@@ -52,7 +53,8 @@ const STRINGS = {
     sStats: "使用统计",
     sStatsEmpty: "还没有转移记录。",
     sStatsDesc: "每次转移记 1 分，之后随时间衰减（99.5% 按 14 天半衰期、0.5% 按 60 天半衰期）。得分 = 所有转移的衰减值之和，所以转得越多、越近，排得越前。",
-    sStatsDevices: (n) => `每台设备只写自己那一份记录，随库同步后合并显示（当前 ${n} 台设备）。清空会对所有设备生效。`,
+    sStatsDevices: (names) => `每台设备只写自己的记录文件（插件目录下的 devices 文件夹），随库同步后合并显示。已合并：${names.join("、")}。清空会对所有设备生效。`,
+    thisDevice: (name) => `${name}（本机）`,
     statLine: (n, score, last) => `转移 ${n} 次 · 得分 ${score} · 上次 ${last}`,
     badgeTitle: (n) => `转移 ${n} 次`,
     pinned: (p) => `已置顶 ${p}`,
@@ -91,7 +93,8 @@ const STRINGS = {
     sStats: "Usage",
     sStatsEmpty: "No moves recorded yet.",
     sStatsDesc: "Each move adds 1 point that decays over time (99.5% with a 14-day half-life, 0.5% with a 60-day half-life). A folder's score is the sum, so more moves and more recent moves both rank higher.",
-    sStatsDevices: (n) => `Each device writes only its own record; they are added up after the vault syncs (${n} device(s) so far). Clearing applies to every device.`,
+    sStatsDevices: (names) => `Each device writes only its own history file (the devices folder in the plugin directory); they are added up after the vault syncs. Included: ${names.join(", ")}. Clearing applies to every device.`,
+    thisDevice: (name) => `${name} (this device)`,
     statLine: (n, score, last) => `${n} move(s) · score ${score} · last ${last}`,
     badgeTitle: (n) => `${n} move(s)`,
     pinned: (p) => `Pinned ${p}`,
@@ -121,9 +124,8 @@ function defaultSettings() {
     boostWhileSearching: true,
     pinned: [],
     excluded: [],
-    // device id -> { usage: { folder path ("/" = vault root) -> entry, see `recordUse` }, since }
-    devices: {},
-    // when history was last cleared on any device; older device sections are dropped
+    // when history was last cleared on any device; older device histories are dropped.
+    // The histories themselves are in per-device files, see `devicesDir`.
     resetAt: 0,
   };
 }
@@ -208,14 +210,26 @@ function rankUsage(usage, now) {
 }
 
 /* Per-device storage ------------------------------------------------ */
-// data.json is shared by every device the vault syncs to. If all devices wrote
-// one usage map, two devices moving notes between syncs would overwrite each
-// other. So each device writes only `devices[<its id>]`, and the ranking uses
-// all sections added up (`mergeEntries` sums exactly).
+// Every device keeps its own history section { usage, since, name } and the
+// ranking uses all sections added up (`mergeEntries` sums exactly).
 
 function newDeviceId() {
   if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") return crypto.randomUUID();
   return Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 10);
+}
+
+/** A readable label for this device, shown in the settings' usage section. */
+function deviceName() {
+  try {
+    if (Platform.isIosApp) return Platform.isTablet ? "iPad" : "iPhone";
+    if (Platform.isAndroidApp) return "Android";
+    if (Platform.isMacOS) return "Mac";
+    if (Platform.isWin) return "Windows";
+    if (Platform.isLinux) return "Linux";
+  } catch (e) {
+    /* ignore */
+  }
+  return "";
 }
 
 function isValidSection(section) {
@@ -236,7 +250,7 @@ function sanitizeDevices(devices) {
     for (const [path, entry] of Object.entries(section.usage)) {
       if (isValidEntry(entry)) usage[path] = entry;
     }
-    result[id] = { usage, since: section.since };
+    result[id] = { usage, since: section.since, name: typeof section.name === "string" ? section.name : "" };
   }
   return result;
 }
@@ -535,7 +549,7 @@ class RecentFolderMovePlugin extends Plugin {
 
   /**
    * A random id kept in this device's local storage, which no sync touches.
-   * Each device records its moves only under its own id in data.json.
+   * It names the one history file this device writes, see `devicesDir`.
    */
   loadDeviceId() {
     const key = "recent-folder-move-device-id";
@@ -559,62 +573,142 @@ class RecentFolderMovePlugin extends Plugin {
   }
 
   /**
-   * Take the other devices' sections and the clear marker from what is on disk
-   * now, keep only our own section from memory. Sections older than the last
-   * "clear history" (on any device) are dropped; ours restarts empty.
+   * Move history lives in one file per device:
+   * `<config dir>/plugins/recent-folder-move/devices/<device id>.json`.
+   *
+   * Each file is only ever written by its own device, so file-level sync
+   * (Google Drive, Remotely Save, …) never sees the same file changed on two
+   * sides and never has to pick one version and drop the other. Reading adds
+   * all the files up. data.json keeps only the shared options.
    */
-  adoptDisk(settings, disk) {
-    const resetAt = Math.max(settings.resetAt || 0, (disk && disk.resetAt) || 0);
-    const devices = sanitizeDevices(disk && disk.devices);
-    let own = settings.devices && settings.devices[this.deviceId];
-    if (!isValidSection(own) || own.since < resetAt) own = { usage: {}, since: Math.max(Date.now(), resetAt) };
-    for (const id of Object.keys(devices)) {
-      if (devices[id].since < resetAt) delete devices[id];
+  devicesDir() {
+    const dir = (this.manifest && this.manifest.dir) || `${this.app.vault.configDir}/plugins/recent-folder-move`;
+    return normalizePath(`${dir}/devices`);
+  }
+
+  deviceFile(id) {
+    return `${this.devicesDir()}/${id}.json`;
+  }
+
+  /** Every device's history file that parses; a half-synced or broken one is skipped this round. */
+  async readDeviceFiles() {
+    const adapter = this.app.vault.adapter;
+    const dir = this.devicesDir();
+    const raw = {};
+    if (!(await adapter.exists(dir))) return raw;
+    const listing = await adapter.list(dir);
+    for (const file of listing.files) {
+      const name = file.slice(file.lastIndexOf("/") + 1);
+      if (!name.endsWith(".json")) continue;
+      try {
+        raw[name.slice(0, -".json".length)] = JSON.parse(await adapter.read(file));
+      } catch (e) {
+        console.warn(`recent-folder-move: skipped ${file}`, e);
+      }
     }
-    devices[this.deviceId] = own;
-    settings.devices = devices;
-    settings.resetAt = resetAt;
+    return sanitizeDevices(raw);
+  }
+
+  async writeDeviceFile(id, section) {
+    const adapter = this.app.vault.adapter;
+    const dir = this.devicesDir();
+    if (!(await adapter.exists(dir))) await adapter.mkdir(dir);
+    await adapter.write(this.deviceFile(id), JSON.stringify(section));
+  }
+
+  newSection(resetAt) {
+    return { usage: {}, since: Math.max(Date.now(), resetAt || 0), name: this.deviceLabel || "" };
+  }
+
+  /**
+   * Apply a "clear history" made on any device: sections older than it are
+   * hidden, and ours restarts empty. Returns true when our own section was reset.
+   */
+  applyReset() {
+    const resetAt = this.settings.resetAt || 0;
+    let ownReset = false;
+    for (const id of Object.keys(this.devices)) {
+      if (this.devices[id].since >= resetAt) continue;
+      if (id === this.deviceId) {
+        this.devices[id] = this.newSection(resetAt);
+        ownReset = true;
+      } else {
+        delete this.devices[id]; // that device rewrites its file empty the next time it runs
+      }
+    }
+    if (!this.devices[this.deviceId]) {
+      this.devices[this.deviceId] = this.newSection(resetAt);
+      ownReset = true;
+    }
+    return ownReset;
   }
 
   async loadSettings() {
     if (!this.deviceId) this.deviceId = this.loadDeviceId();
+    if (this.deviceLabel === undefined) this.deviceLabel = deviceName();
     const data = (await this.loadData()) || {};
     const settings = Object.assign(defaultSettings(), data);
     for (const key of ["pinned", "excluded"]) {
       if (!Array.isArray(settings[key])) settings[key] = [];
     }
+    if (typeof settings.resetAt !== "number" || !isFinite(settings.resetAt)) settings.resetAt = 0;
 
-    // 1.0 kept a `recent` list, 1.1 a single `usage` map: both become this device's history.
+    // Older versions kept history inside data.json: 1.0 a `recent` list and 1.1 a
+    // `usage` map (both become this device's history), 1.2 per-device `devices`
+    // sections (each becomes that device's file).
     let legacy = null;
     if (data.usage && typeof data.usage === "object" && !Array.isArray(data.usage)) legacy = data.usage;
     else if (Array.isArray(data.recent)) legacy = usageFromRecentList(data.recent, Date.now());
-    const migrated = "usage" in data || "recent" in data;
+    const legacySections = sanitizeDevices(data.devices);
+    const migrated = "usage" in data || "recent" in data || "devices" in data;
     delete settings.usage;
     delete settings.recent;
+    delete settings.devices;
 
-    settings.devices = sanitizeDevices(data.devices);
-    // After the first load our own section in memory is the authority (only we write it),
-    // so a reload racing with a move cannot lose that move.
-    const current = this.settings && this.settings.devices && this.settings.devices[this.deviceId];
-    if (isValidSection(current)) settings.devices[this.deviceId] = current;
-    this.adoptDisk(settings, data);
+    const devices = await this.readDeviceFiles();
+    const toWrite = new Set();
+    for (const [id, section] of Object.entries(legacySections)) {
+      if (!devices[id]) {
+        devices[id] = section;
+        toWrite.add(id);
+      }
+    }
+    // After the first load our own section in memory is the authority (only we
+    // write it), so a reload racing with a move cannot lose that move.
+    const current = this.devices && this.devices[this.deviceId];
+    if (isValidSection(current)) devices[this.deviceId] = current;
+
+    this.settings = settings;
+    this.devices = devices;
+    if (this.applyReset()) toWrite.add(this.deviceId);
     if (legacy) {
-      const own = settings.devices[this.deviceId].usage;
+      const own = this.ownUsage();
       for (const [path, entry] of Object.entries(legacy)) {
         if (isValidEntry(entry)) own[path] = own[path] ? mergeEntries(own[path], entry) : entry;
       }
+      toWrite.add(this.deviceId);
     }
+    this.mergedUsage = mergeDevices(this.devices);
 
-    this.settings = settings;
-    this.mergedUsage = mergeDevices(settings.devices);
-    if (migrated) await this.saveSettings();
+    for (const id of toWrite) await this.writeDeviceFile(id, this.devices[id]);
+    if (migrated) await this.saveData(this.settings);
   }
 
+  /** Save the shared options (data.json). Takes a newer "clear history" from disk into account. */
   async saveSettings() {
-    // Another device may have synced its moves in since we last read the file.
-    this.adoptDisk(this.settings, await this.loadData());
-    this.mergedUsage = mergeDevices(this.settings.devices);
+    const disk = (await this.loadData()) || {};
+    if (typeof disk.resetAt === "number" && disk.resetAt > this.settings.resetAt) {
+      this.settings.resetAt = disk.resetAt;
+      if (this.applyReset()) await this.saveOwn();
+    }
+    this.mergedUsage = mergeDevices(this.devices);
     await this.saveData(this.settings);
+  }
+
+  /** Save this device's history file. */
+  async saveOwn() {
+    this.mergedUsage = mergeDevices(this.devices);
+    await this.writeDeviceFile(this.deviceId, this.devices[this.deviceId]);
   }
 
   /** Called by Obsidian when data.json was changed from outside, e.g. by sync. */
@@ -622,7 +716,7 @@ class RecentFolderMovePlugin extends Plugin {
     await this.loadSettings();
   }
 
-  /** Re-read data.json (cheap) so a just-synced move from another device counts, then open the picker. */
+  /** Re-read the history files (small) so moves just synced from other devices count, then open the picker. */
   async openModal(files) {
     try {
       await this.loadSettings();
@@ -634,7 +728,7 @@ class RecentFolderMovePlugin extends Plugin {
 
   /** This device's own usage map: the only one this device ever writes. */
   ownUsage() {
-    return this.settings.devices[this.deviceId].usage;
+    return this.devices[this.deviceId].usage;
   }
 
   /** Forget this device's lowest-scoring folders beyond `historySize`. */
@@ -648,21 +742,25 @@ class RecentFolderMovePlugin extends Plugin {
   /** Count one move into a folder. */
   async touch(folderPath) {
     const p = folderPath === "" ? "/" : folderPath;
-    // Pick up a "clear history" from another device first; dropping our section
+    // Pick up a "clear history" from another device first; resetting our section
     // after recording would drop this move with it.
-    this.adoptDisk(this.settings, await this.loadData());
+    const disk = (await this.loadData()) || {};
+    if (typeof disk.resetAt === "number" && disk.resetAt > this.settings.resetAt) {
+      this.settings.resetAt = disk.resetAt;
+      this.applyReset();
+    }
     const usage = this.ownUsage();
     usage[p] = recordUse(usage[p], Date.now());
     this.pruneUsage();
-    await this.saveSettings();
+    await this.saveOwn();
   }
 
-  /** Clear history on every device: each one drops its section the next time it reads data.json. */
+  /** Clear history on every device: each one empties its own file the next time it reads data.json. */
   async clearUsage() {
-    const now = Date.now();
-    this.settings.resetAt = now;
-    this.settings.devices = { [this.deviceId]: { usage: {}, since: now } };
-    await this.saveSettings();
+    this.settings.resetAt = Date.now();
+    this.applyReset();
+    await this.saveOwn();
+    await this.saveData(this.settings);
   }
 
   async ensureFolder(path) {
@@ -720,6 +818,7 @@ class RecentFolderMovePlugin extends Plugin {
   async onRename(file, oldPath) {
     const settings = this.settings;
     let changed = false;
+    let ownChanged = false;
 
     // Keep stored folder paths in sync when a folder is renamed or moved.
     if (file instanceof TFolder) {
@@ -735,15 +834,17 @@ class RecentFolderMovePlugin extends Plugin {
           }
           return p;
         });
-      // Only our own section: the other devices remap theirs when the rename syncs to them.
-      const own = settings.devices[this.deviceId];
+      // Only our own history: the other devices remap theirs when the rename syncs to them.
+      const own = this.devices[this.deviceId];
       const usage = {};
       for (const [p, entry] of Object.entries(own.usage)) {
         const [q] = remap([p]);
+        if (q !== p) ownChanged = true;
         // Merge in case the new path already had history of its own.
         usage[q] = usage[q] ? mergeEntries(usage[q], entry) : entry;
       }
       own.usage = usage;
+      changed = false;
       settings.pinned = remap(settings.pinned);
       settings.excluded = remap(settings.excluded);
     }
@@ -762,14 +863,17 @@ class RecentFolderMovePlugin extends Plugin {
         const last = this.lastExternalMove;
         this.lastExternalMove = { dest: newParent, time: now };
         if (last && last.dest === newParent && now - last.time < COALESCE_MS) {
+          if (ownChanged) await this.saveOwn();
           if (changed) await this.saveSettings();
           return;
         }
+        if (changed) await this.saveSettings();
         await this.touch(newParent);
         return;
       }
     }
 
+    if (ownChanged) await this.saveOwn();
     if (changed) await this.saveSettings();
   }
 
@@ -784,7 +888,7 @@ class RecentFolderMovePlugin extends Plugin {
         changed = true;
       }
     }
-    if (changed) await this.saveSettings();
+    if (changed) await this.saveOwn();
   }
 }
 
@@ -799,6 +903,14 @@ class RecentFolderMoveSettingTab extends PluginSettingTab {
   }
 
   display() {
+    // Re-read first so the usage list includes moves synced from other devices.
+    this.plugin
+      .loadSettings()
+      .catch((e) => console.error(e))
+      .then(() => this.render());
+  }
+
+  render() {
     const { containerEl } = this;
     const s = t();
     const settings = this.plugin.settings;
@@ -829,6 +941,7 @@ class RecentFolderMoveSettingTab extends PluginSettingTab {
           .onChange(async (v) => {
             this.plugin.settings.historySize = v;
             this.plugin.pruneUsage();
+            await this.plugin.saveOwn();
             await this.plugin.saveSettings();
           })
       );
@@ -889,10 +1002,11 @@ class RecentFolderMoveSettingTab extends PluginSettingTab {
     );
 
     new Setting(containerEl).setName(s.sStats).setDesc(s.sStatsDesc).setHeading();
-    containerEl.createEl("p", {
-      cls: "setting-item-description",
-      text: s.sStatsDevices(Object.keys(settings.devices).length),
+    const names = Object.entries(this.plugin.devices).map(([id, section]) => {
+      const name = section.name || id.slice(0, 8);
+      return id === this.plugin.deviceId ? s.thisDevice(name) : name;
     });
+    containerEl.createEl("p", { cls: "setting-item-description", text: s.sStatsDevices(names) });
     const now = Date.now();
     const usage = this.plugin.mergedUsage;
     const ranked = rankUsage(usage, now);
@@ -912,6 +1026,7 @@ module.exports = RecentFolderMovePlugin;
 module.exports.default = RecentFolderMovePlugin;
 module.exports._internals = {
   RecentFolderModal,
+  RecentFolderMoveSettingTab,
   parentPath,
   isSameOrInside,
   joinPath,

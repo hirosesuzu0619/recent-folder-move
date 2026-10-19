@@ -13,7 +13,7 @@ Obsidian's built-in move dialog always lists folders in the same fixed order, so
 - **Create on the fly** – `Shift+Enter` creates the typed path (nested folders included) and moves the note there.
 - **Tracks every move** – the plugin's own "Move to…" menu, drag and drop in the file explorer and the built-in move command all count (the last two can be turned off). Moving several files at once counts as one move.
 - **Usage stats** – settings list every folder's move count, score and last use.
-- **Syncs across devices** – history lives in the plugin's `data.json` inside the vault, so it travels with the vault. Each device writes only its own section and the sections are added up, so moves made on two devices between syncs never overwrite each other. Clearing history clears it everywhere.
+- **Syncs across devices** – each device keeps its history in its own file inside the plugin folder, and the files are added up. File-level sync (Google Drive, Remotely Save, iCloud, Syncthing …) never sees one file changed on two devices, so moves made on several devices between syncs are never overwritten. Clearing history clears it everywhere.
 - **Multi-select** – right-click several files in the file explorer and move them together.
 - Folder renames and deletions keep the history in sync. Links are updated through Obsidian's own file manager.
 - Chinese and English UI, following Obsidian's language setting.
@@ -31,18 +31,19 @@ More moves add more terms and recent moves weigh more, so both frequency and rec
 
 ## Sync
 
-Move history is stored in `<vault>/.obsidian/plugins/recent-folder-move/data.json`:
+Move history is stored as one file per device:
 
-```json
-{
-  "devices": {
-    "<device id>": { "usage": { "Projects/A": { "n": 12, "fast": 3.1, "slow": 9.4, "at": 1760000000000, "last": 1760000000000 } }, "since": 1760000000000 }
-  },
-  "resetAt": 0
-}
+```
+<vault>/.obsidian/plugins/recent-folder-move/
+  data.json                  shared options (limits, pinned, excluded, last "clear history" time)
+  devices/<device id>.json   { "usage": { "Projects/A": { "n": 12, "fast": …, "slow": …, "at": …, "last": … } }, "since": …, "name": "Mac" }
 ```
 
-The device id is kept in each device's local storage. Before saving, a device re-reads the file and replaces only its own section, and the picker re-reads the file each time it opens. Any sync that copies `data.json` works (iCloud, Google Drive, Syncthing, Git). With Obsidian Sync, turn on *Settings → Sync → Installed community plugins*, otherwise plugin data is not synced.
+The device id is kept in each device's local storage, which is not synced. A device only ever writes its own file, so sync tools that resolve conflicts by keeping the newer file (Google Drive, Remotely Save's free tier) can't drop another device's moves. The picker and the settings page re-read all files each time they open; *Settings → Usage* lists the devices that are included.
+
+Whatever syncs the vault has to include the `.obsidian` folder. Google Drive / iCloud / Syncthing clients do. **Remotely Save** does not by default: turn on its config-folder sync (marked experimental). **Obsidian Sync**: turn on *Installed community plugins*.
+
+History from 1.0–1.2 (kept inside `data.json`) moves into the device files on first load.
 
 ## Usage
 
